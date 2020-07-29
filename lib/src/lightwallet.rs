@@ -733,6 +733,14 @@ impl LightWallet {
         }
     }
 
+    /// Get the height of the anchor block
+    pub fn get_anchor_height(&self) -> u32 {
+        match self.get_target_height_and_anchor_offset() {
+            Some((height, anchor_offset)) => height - anchor_offset as u32 - 1,
+            None => return 0,
+        }
+    }
+
     pub fn memo_str(memo: &Option<Memo>) -> Option<String> {
         match memo {
             Some(memo) => {
@@ -1003,10 +1011,7 @@ impl LightWallet {
     }
 
     pub fn spendable_zbalance(&self, addr: Option<String>) -> u64 {
-        let anchor_height = match self.get_target_height_and_anchor_offset() {
-            Some((height, anchor_offset)) => height - anchor_offset as u32 - 1,
-            None => return 0,
-        };
+        let anchor_height = self.get_anchor_height();
 
         self.txs
             .read()
@@ -2061,22 +2066,12 @@ impl LightWallet {
                 Some(s) => {
                     // If the string starts with an "0x", and contains only hex chars ([a-f0-9]+) then
                     // interpret it as a hex
-                    let s_bytes = if s.to_lowercase().starts_with("0x") {
-                        match hex::decode(&s[2..s.len()]) {
-                            Ok(data) => data,
-                            Err(_) => Vec::from(s.as_bytes())
-                        }
-                    } else {
-                        Vec::from(s.as_bytes())
-                    };
-
-                    match Memo::from_bytes(&s_bytes) {
-                        None => {
-                            let e = format!("Error creating output. Memo {:?} is too long", s);
+                    match utils::interpret_memo_string(&s) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
                             error!("{}", e);
                             return Err(e);
-                        },
-                        Some(m) => Some(m)
+                        }
                     }
                 }
             };
@@ -2149,10 +2144,16 @@ impl LightWallet {
                                 None    => Memo::default(),
                                 Some(s) => {
                                     // If the address is not a z-address, then drop the memo
-                                    if LightWallet::is_shielded_address(&addr.to_string(), &self.config) {
-                                            Memo::from_bytes(s.as_bytes()).unwrap()
-                                    } else {
+                                    if !LightWallet::is_shielded_address(&addr.to_string(), &self.config) {
                                         Memo::default()
+                                    } else {
+                                        match utils::interpret_memo_string(s) {
+                                            Ok(m) => m,
+                                            Err(e) => {
+                                                error!("{}", e);
+                                                Memo::default()
+                                            }
+                                        }
                                     }                                        
                                 }
                             },

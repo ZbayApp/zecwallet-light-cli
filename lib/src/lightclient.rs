@@ -817,6 +817,8 @@ impl LightClient {
         let mut unspent_notes: Vec<JsonValue> = vec![];
         let mut spent_notes  : Vec<JsonValue> = vec![];
         let mut pending_notes: Vec<JsonValue> = vec![];
+        
+        let anchor_height: i32 = self.wallet.read().unwrap().get_anchor_height() as i32;
 
         {
             // Collect Sapling notes
@@ -834,9 +836,9 @@ impl LightClient {
                                 "value"              => nd.note.value,
                                 "is_change"          => nd.is_change,
                                 "address"            => LightWallet::note_address(self.config.hrp_sapling_address(), nd),
+                                "spendable"          => wtx.block <= anchor_height && nd.spent.is_none() && nd.unconfirmed_spent.is_none(),
                                 "spent"              => nd.spent.map(|spent_txid| format!("{}", spent_txid)),
                                 "spent_at_height"    => nd.spent_at_height.map(|h| format!("{}", h)),
-                                "witness_size"       => nd.witnesses.len(),
                                 "unconfirmed_spent"  => nd.unconfirmed_spent.map(|spent_txid| format!("{}", spent_txid)),
                             })
                         }
@@ -1013,11 +1015,18 @@ impl LightClient {
 
             // Collect outgoing metadata
             let outgoing_json = wtx.outgoing_metadata.iter()
-                .map(|om| 
-                    object!{
+                .map(|om| {
+                    let mut o = object!{
                         "address" => om.address.clone(),
                         "value"   => om.value,
                         "memo"    => LightWallet::memo_str(&Some(om.memo.clone())),
+                    };
+
+                    if include_memo_hex {
+                        o.insert("memohex", hex::encode(om.memo.as_bytes())).unwrap();
+                    }
+
+                    return o;
                 }).collect::<Vec<JsonValue>>();                    
 
             object! {
