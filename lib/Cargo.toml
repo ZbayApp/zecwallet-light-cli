@@ -42,33 +42,33 @@ webpki-roots = "0.18.0"
 
 [dependencies.bellman]
 git = "https://github.com/NorbertBodziony/librustzcash.git"
-rev = "9e5e9188214c522d9f66e51397b37610588e8008"
+rev = "0b23595bf66d4acb16ffc97fa670d104a5a1ce9a"
 default-features = false
 features = ["groth16"]
 
 [dependencies.pairing]
 git = "https://github.com/NorbertBodziony/librustzcash.git"
-rev = "9e5e9188214c522d9f66e51397b37610588e8008"
+rev = "0b23595bf66d4acb16ffc97fa670d104a5a1ce9a"
 
 [dependencies.zcash_client_backend]
 git = "https://github.com/NorbertBodziony/librustzcash.git"
-rev = "9e5e9188214c522d9f66e51397b37610588e8008"
+rev = "0b23595bf66d4acb16ffc97fa670d104a5a1ce9a"
 default-features = false
 
 [dependencies.zcash_primitives]
 git = "https://github.com/NorbertBodziony/librustzcash.git"
-rev = "9e5e9188214c522d9f66e51397b37610588e8008"
+rev = "0b23595bf66d4acb16ffc97fa670d104a5a1ce9a"
 default-features = false
 features = ["transparent-inputs"]
 
 [dependencies.zcash_proofs]
 git = "https://github.com/NorbertBodziony/librustzcash.git"
-rev = "9e5e9188214c522d9f66e51397b37610588e8008"
+rev = "0b23595bf66d4acb16ffc97fa670d104a5a1ce9a"
 default-features = false
 
 [dependencies.ff]
 git = "https://github.com/NorbertBodziony/librustzcash.git"
-rev = "9e5e9188214c522d9f66e51397b37610588e8008"
+rev = "0b23595bf66d4acb16ffc97fa670d104a5a1ce9a"
 features = ["ff_derive"]
 
 [build-dependencies]
