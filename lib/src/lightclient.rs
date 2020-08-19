@@ -37,8 +37,8 @@ use crate::ANCHOR_OFFSET;
 mod checkpoints;
 
 pub const DEFAULT_SERVER: &str = "https://lightwalletd.zecwallet.co:1443";
-pub const WALLET_NAME: &str    = "zecwallet-light-wallet.dat";
-pub const LOGFILE_NAME: &str   = "zecwallet-light-wallet.debug.log";
+pub const WALLET_NAME: &str    = "zecwallet-light-zbay-wallet.dat";
+pub const LOGFILE_NAME: &str   = "zecwallet-light-zbay-wallet.debug.log";
 
 #[derive(Clone, Debug)]
 pub struct WalletStatus {
