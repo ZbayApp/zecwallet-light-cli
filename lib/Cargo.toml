@@ -48,17 +48,17 @@ bls12_381 = "0.3.1"
 group = "0.8"
 
 [dependencies.zcash_client_backend]
-git = "https://github.com/adityapk00/librustzcash"
-rev = "3cb555b2d4c4d05e95c5e9663fe91521a670ebfc"
+git = "https://github.com/ZbayApp/librustzcash"
+rev = "9978187dca0e97da97894588fbbf774e130b2d78"
 
 [dependencies.zcash_primitives]
-git = "https://github.com/adityapk00/librustzcash"
-rev = "3cb555b2d4c4d05e95c5e9663fe91521a670ebfc"
+git = "https://github.com/ZbayApp/librustzcash"
+rev = "9978187dca0e97da97894588fbbf774e130b2d78"
 features = ["transparent-inputs"]
 
 [dependencies.zcash_proofs]
-git = "https://github.com/adityapk00/librustzcash"
-rev = "3cb555b2d4c4d05e95c5e9663fe91521a670ebfc"
+git = "https://github.com/ZbayApp/librustzcash"
+rev = "9978187dca0e97da97894588fbbf774e130b2d78"
 features = ["multicore"]
 
 [build-dependencies]
