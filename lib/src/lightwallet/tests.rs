@@ -1,8 +1,8 @@
 use std::convert::TryInto;
 use rand::{RngCore, rngs::OsRng};
 
-use ff::{Field, PrimeField};
-use pairing::bls12_381::Bls12;
+use ff::{PrimeField, Field};
+use group::GroupEncoding;
 use protobuf::{Message, UnknownFields, CachedSize, RepeatedField};
 use zcash_client_backend::{encoding::{encode_payment_address, decode_payment_address, decode_extended_spending_key, decode_extended_full_viewing_key},
     proto::compact_formats::{
@@ -11,9 +11,8 @@ use zcash_client_backend::{encoding::{encode_payment_address, decode_payment_add
 };
 use zcash_primitives::{
     block::BlockHash,
-    jubjub::fs::Fs,
     note_encryption::{Memo, SaplingNoteEncryption},
-    primitives::{Note, PaymentAddress},
+    primitives::{Note, PaymentAddress, Rseed},
     legacy::{Script, TransparentAddress,},
     transaction::{
         TxId, Transaction, TransactionData,
@@ -21,7 +20,6 @@ use zcash_primitives::{
         components::amount::DEFAULT_FEE,
     },
     zip32::{ExtendedFullViewingKey, ExtendedSpendingKey},
-    JUBJUB,
 };
 
 use sha2::{Sha256, Digest};
@@ -89,10 +87,10 @@ impl FakeCompactBlock {
             let mut c_out = CompactOutput::default();
 
             let mut cmu_bytes = vec![];
-            cmu_bytes.extend_from_slice(&o.cmu.to_repr().0);
+            cmu_bytes.extend_from_slice(&o.cmu.to_repr());
 
             let mut epk_bytes = vec![];
-            o.ephemeral_key.write(&mut epk_bytes).unwrap();
+            epk_bytes.extend_from_slice(&o.ephemeral_key.to_bytes());
 
             c_out.set_cmu(cmu_bytes);
             c_out.set_epk(epk_bytes);
@@ -128,22 +126,22 @@ impl FakeCompactBlock {
         // Create a fake Note for the account
         let mut rng = OsRng;
         let note = Note {
-            g_d: to.diversifier().g_d::<Bls12>(&JUBJUB).unwrap(),
+            g_d: to.diversifier().g_d().unwrap(),
             pk_d: to.pk_d().clone(),
             value: value.into(),
-            r: Fs::random(&mut rng),
+            rseed: Rseed::BeforeZip212(jubjub::Fr::random(rng)),
         };
         let encryptor = SaplingNoteEncryption::new(
-            extfvk.fvk.ovk,
+            Some(extfvk.fvk.ovk),
             note.clone(),
             to.clone(),
             Memo::default(),
             &mut rng,
         );
         let mut cmu = vec![];
-        cmu.extend_from_slice(&note.cm(&JUBJUB).to_repr().0);
+        cmu.extend_from_slice(&note.cmu().to_repr());
         let mut epk = vec![];
-        encryptor.epk().write(&mut epk).unwrap();
+        epk.extend_from_slice(&encryptor.epk().to_bytes());
         let enc_ciphertext = encryptor.encrypt_note_plaintext();
 
         // Create a fake CompactBlock containing the note
@@ -158,13 +156,13 @@ impl FakeCompactBlock {
         ctx.outputs.push(cout);
         
         self.block.vtx.push(ctx);
-        (note.nf(&extfvk.fvk.vk, 0, &JUBJUB), TxId(txid[..].try_into().unwrap()))
+        (note.nf(&extfvk.fvk.vk, 0), TxId(txid[..].try_into().unwrap()))
     }
 
     fn add_tx_spending(&mut self, 
                         (nf, in_value): (Vec<u8>, u64),
                         extfvk: ExtendedFullViewingKey,
-                        to: PaymentAddress<Bls12>,
+                        to: PaymentAddress,
                         value: u64) -> TxId {
         let mut rng = OsRng;
 
@@ -183,22 +181,22 @@ impl FakeCompactBlock {
         // Create a fake Note for the payment
         ctx.outputs.push({
             let note = Note {
-                g_d: to.diversifier().g_d::<Bls12>(&JUBJUB).unwrap(),
+                g_d: to.diversifier().g_d().unwrap(),
                 pk_d: to.pk_d().clone(),
                 value: value.into(),
-                r: Fs::random(&mut rng),
+                rseed: Rseed::BeforeZip212(jubjub::Fr::random(rng)),
             };
             let encryptor = SaplingNoteEncryption::new(
-                extfvk.fvk.ovk,
+                Some(extfvk.fvk.ovk),
                 note.clone(),
                 to,
                 Memo::default(),
                 &mut rng,
             );
             let mut cmu = vec![];
-            cmu.extend_from_slice(&note.cm(&JUBJUB).to_repr().0);
+            cmu.extend_from_slice(&note.cmu().to_repr());
             let mut epk = vec![];
-            encryptor.epk().write(&mut epk).unwrap();
+            epk.extend_from_slice(&encryptor.epk().to_bytes());
             let enc_ciphertext = encryptor.encrypt_note_plaintext();
 
             let mut cout = CompactOutput::new();
@@ -212,22 +210,22 @@ impl FakeCompactBlock {
         ctx.outputs.push({
             let change_addr = extfvk.default_address().unwrap().1;
             let note = Note {
-                g_d: change_addr.diversifier().g_d::<Bls12>(&JUBJUB).unwrap(),
+                g_d: change_addr.diversifier().g_d().unwrap(),
                 pk_d: change_addr.pk_d().clone(),
                 value: (in_value - value).into(),
-                r: Fs::random(&mut rng),
+                rseed: Rseed::BeforeZip212(jubjub::Fr::random(rng)),
             };
             let encryptor = SaplingNoteEncryption::new(
-                extfvk.fvk.ovk,
+                Some(extfvk.fvk.ovk),
                 note.clone(),
                 change_addr,
                 Memo::default(),
                 &mut rng,
             );
             let mut cmu = vec![];
-            cmu.extend_from_slice(&note.cm(&JUBJUB).to_repr().0);
+            cmu.extend_from_slice(&note.cmu().to_repr());
             let mut epk = vec![];
-            encryptor.epk().write(&mut epk).unwrap();
+            epk.extend_from_slice(&encryptor.epk().to_bytes());
             let enc_ciphertext = encryptor.encrypt_note_plaintext();
 
             let mut cout = CompactOutput::new();
@@ -244,28 +242,22 @@ impl FakeCompactBlock {
 }
 
 struct FakeTransaction {
-    tx: Transaction,
+    txouts: Vec<TxOut>,
+    txins: Vec<TxIn>,
 }
 
 impl FakeTransaction {
     // New FakeTransaction with random txid
-    fn new<R: RngCore>(rng: &mut R) -> Self {
-        let mut txid = [0u8; 32];
-        rng.fill_bytes(&mut txid);
-        FakeTransaction::new_with_txid(TxId(txid))
+    fn new() -> Self {
+        FakeTransaction{ txouts: vec![], txins: vec![] }
     }
 
-    fn new_with_txid(txid: TxId) -> Self {
-        FakeTransaction {
-            tx: Transaction {
-                txid,
-                data: TransactionData::new()
-            }
-        }
-    }
+    fn get_tx(self) -> Transaction {
+        let mut tx_data = TransactionData::new();
+        tx_data.vin.extend_from_slice(&self.txins);
+        tx_data.vout.extend_from_slice(&self.txouts);
 
-    fn get_tx(&self) -> &Transaction {
-        &self.tx
+        tx_data.freeze().unwrap()
     }
 
     fn add_t_output(&mut self, pk: &PublicKey, value: u64) {
@@ -274,18 +266,15 @@ impl FakeTransaction {
 
         let taddr_bytes = hash160.result();
 
-        self.tx.data.vout.push(TxOut {
+        self.txouts.push(TxOut {
             value: Amount::from_u64(value).unwrap(),
             script_pubkey: TransparentAddress::PublicKey(taddr_bytes.try_into().unwrap()).script(),
         });
     }
 
     fn add_t_input(&mut self, txid: TxId, n: u32) {
-        self.tx.data.vin.push(TxIn {
-            prevout: OutPoint{
-                hash: txid.0,
-                n
-            },
+        self.txins.push(TxIn {
+            prevout: OutPoint::new(txid.0, n),
             script_sig: Script{0: vec![]},
             sequence: 0,
         });
@@ -382,7 +371,6 @@ fn test_z_change_balances() {
 
 #[test]
 fn test_t_receive_spend() {
-    let mut rng = OsRng;
     let secp = Secp256k1::new();
 
     let wallet = LightWallet::new(None, &get_test_config(), 0).unwrap();
@@ -392,11 +380,13 @@ fn test_t_receive_spend() {
 
     const AMOUNT1: u64 = 20;
 
-    let mut tx = FakeTransaction::new(&mut rng);
-    tx.add_t_output(&pk, AMOUNT1);
-    let txid1 = tx.get_tx().txid();
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_output(&pk, AMOUNT1);
 
-    wallet.scan_full_tx(&tx.get_tx(), 100, 0);  // Pretend it is at height 100
+    let tx = ftx.get_tx();
+    let txid1 = tx.txid();
+
+    wallet.scan_full_tx(&tx, 100, 0);  // Pretend it is at height 100
 
     {
         let txs = wallet.txs.read().unwrap();
@@ -417,11 +407,13 @@ fn test_t_receive_spend() {
     }
 
     // Create a new Tx, spending this taddr
-    let mut tx = FakeTransaction::new(&mut rng);
-    tx.add_t_input(txid1, 0);
-    let txid2 = tx.get_tx().txid();
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_input(txid1, 0);
 
-    wallet.scan_full_tx(&tx.get_tx(), 101, 0);  // Pretent it is at height 101
+    let tx = ftx.get_tx();
+    let txid2 = tx.txid();
+
+    wallet.scan_full_tx(&tx, 101, 0);  // Pretent it is at height 101
 
     {
         // Make sure the txid was spent
@@ -448,7 +440,6 @@ fn test_t_receive_spend() {
 /// This test spends and receives t addresses among non-wallet t addresses to make sure that
 /// we're detecting and spending only our t addrs.
 fn test_t_receive_spend_among_tadds() {
-    let mut rng = OsRng;
     let secp = Secp256k1::new();
 
     let wallet = LightWallet::new(None, &get_test_config(), 0).unwrap();
@@ -461,14 +452,16 @@ fn test_t_receive_spend_among_tadds() {
 
     const AMOUNT1: u64 = 30;
 
-    let mut tx = FakeTransaction::new(&mut rng);
+    let mut ftx = FakeTransaction::new();
     // Add a non-wallet output
-    tx.add_t_output(&non_wallet_pk, 20);
-    tx.add_t_output(&pk, AMOUNT1);  // Our wallet t output
-    tx.add_t_output(&non_wallet_pk, 25);
-    let txid1 = tx.get_tx().txid();
+    ftx.add_t_output(&non_wallet_pk, 20);
+    ftx.add_t_output(&pk, AMOUNT1);  // Our wallet t output
+    ftx.add_t_output(&non_wallet_pk, 25);
 
-    wallet.scan_full_tx(&tx.get_tx(), 100, 0);  // Pretend it is at height 100
+    let tx = ftx.get_tx();
+    let txid1 = tx.txid();
+
+    wallet.scan_full_tx(&tx, 100, 0);  // Pretend it is at height 100
 
     {
         let txs = wallet.txs.read().unwrap();
@@ -489,11 +482,13 @@ fn test_t_receive_spend_among_tadds() {
     }
 
     // Create a new Tx, spending this taddr
-    let mut tx = FakeTransaction::new(&mut rng);
-    tx.add_t_input(txid1, 1);   // Ours was at position 1 in the input tx
-    let txid2 = tx.get_tx().txid();
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_input(txid1, 1);   // Ours was at position 1 in the input tx
 
-    wallet.scan_full_tx(&tx.get_tx(), 101, 0);  // Pretent it is at height 101
+    let tx = ftx.get_tx();
+    let txid2 = tx.txid();
+
+    wallet.scan_full_tx(&tx, 101, 0);  // Pretent it is at height 101
 
     {
         // Make sure the txid was spent
@@ -541,9 +536,12 @@ fn test_serialization() {
 
     const TAMOUNT1: u64 = 20;
 
-    let mut tx = FakeTransaction::new_with_txid(txid1);
-    tx.add_t_output(&pk, TAMOUNT1);
-    wallet.scan_full_tx(&tx.get_tx(), 0, 0);  // Height 0
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_output(&pk, TAMOUNT1);
+
+    let tx = ftx.get_tx();
+    let ttxid1 = tx.txid();
+    wallet.scan_full_tx(&tx, 0, 0);  // Height 0
 
     const AMOUNT2:u64 = 2;
 
@@ -554,9 +552,12 @@ fn test_serialization() {
     let txid2 = cb2.add_tx_spending((nf1, AMOUNT1), extfvk.clone(), addr2, AMOUNT2);
     wallet.scan_block(&cb2.as_bytes()).unwrap();
 
-    let mut tx = FakeTransaction::new_with_txid(txid2);
-    tx.add_t_input(txid1, 0);
-    wallet.scan_full_tx(&tx.get_tx(), 1, 0);  // Height 1
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_input(ttxid1, 0);
+
+    let tx = ftx.get_tx();
+    let ttxid2 = tx.txid();
+    wallet.scan_full_tx(&tx, 1, 0);  // Height 1
 
     // Now, the original note should be spent and there should be a change
     assert_eq!(wallet.zbalance(None), AMOUNT1 - AMOUNT2 ); // The t addr amount is received + spent, so it cancels out
@@ -600,14 +601,14 @@ fn test_serialization() {
         assert_eq!(txs[&txid1].notes[0].is_change, false);
 
         // Old UTXO was spent
-        assert_eq!(txs[&txid1].utxos.len(), 1);
-        assert_eq!(txs[&txid1].utxos[0].address, taddr);
-        assert_eq!(txs[&txid1].utxos[0].txid, txid1);
-        assert_eq!(txs[&txid1].utxos[0].output_index, 0);
-        assert_eq!(txs[&txid1].utxos[0].value, TAMOUNT1);
-        assert_eq!(txs[&txid1].utxos[0].height, 0);
-        assert_eq!(txs[&txid1].utxos[0].spent, Some(txid2));
-        assert_eq!(txs[&txid1].utxos[0].unconfirmed_spent, None);
+        assert_eq!(txs[&ttxid1].utxos.len(), 1);
+        assert_eq!(txs[&ttxid1].utxos[0].address, taddr);
+        assert_eq!(txs[&ttxid1].utxos[0].txid, ttxid1);
+        assert_eq!(txs[&ttxid1].utxos[0].output_index, 0);
+        assert_eq!(txs[&ttxid1].utxos[0].value, TAMOUNT1);
+        assert_eq!(txs[&ttxid1].utxos[0].height, 0);
+        assert_eq!(txs[&ttxid1].utxos[0].spent, Some(ttxid2));
+        assert_eq!(txs[&ttxid1].utxos[0].unconfirmed_spent, None);
 
         // new note is not spent
         assert_eq!(txs[&txid2].txid, txid2);
@@ -618,8 +619,8 @@ fn test_serialization() {
         assert_eq!(txs[&txid2].total_shielded_value_spent, AMOUNT1);
 
         // The UTXO was spent in txid2
-        assert_eq!(txs[&txid2].utxos.len(), 0); // The second TxId has no UTXOs
-        assert_eq!(txs[&txid2].total_transparent_value_spent, TAMOUNT1);
+        assert_eq!(txs[&ttxid2].utxos.len(), 0); // The second TxId has no UTXOs
+        assert_eq!(txs[&ttxid2].total_transparent_value_spent, TAMOUNT1);
     }
 }
 
@@ -659,7 +660,6 @@ fn get_test_config() -> LightClientConfig {
         server: "0.0.0.0:0".parse().unwrap(),
         chain_name: "test".to_string(),
         sapling_activation_height: 0,
-        consensus_branch_id: "000000".to_string(),
         anchor_offset: 0,
         data_dir: None,
     }
@@ -671,7 +671,6 @@ fn get_main_config() -> LightClientConfig {
         server: "0.0.0.0:0".parse().unwrap(),
         chain_name: "main".to_string(),
         sapling_activation_height: 0,
-        consensus_branch_id: "000000".to_string(),
         anchor_offset: 0,
         data_dir: None,
     }
@@ -722,7 +721,6 @@ fn test_unconfirmed_txns() {
         server: "0.0.0.0:0".parse().unwrap(),
         chain_name: "test".to_string(),
         sapling_activation_height: 0,
-        consensus_branch_id: "000000".to_string(),
         anchor_offset: 5, // offset = 5
         data_dir: None,
     };
@@ -1012,7 +1010,6 @@ fn test_z_spend_to_z() {
 
 #[test]
 fn test_self_txns_ttoz_withmemo() {
-    let mut rng = OsRng;
     let secp = Secp256k1::new();
 
     let (wallet, _txid1, block_hash) = get_test_wallet(0);
@@ -1022,11 +1019,13 @@ fn test_self_txns_ttoz_withmemo() {
 
     const TAMOUNT1: u64 = 50000;
 
-    let mut tx = FakeTransaction::new(&mut rng);
-    tx.add_t_output(&pk, TAMOUNT1);
-    let txid1 = tx.get_tx().txid();
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_output(&pk, TAMOUNT1);
 
-    wallet.scan_full_tx(&tx.get_tx(), 1, 0); 
+    let tx = ftx.get_tx();
+    let txid1 = tx.txid();
+
+    wallet.scan_full_tx(&tx, 1, 0); 
 
     {
         let txs = wallet.txs.read().unwrap();
@@ -1068,7 +1067,6 @@ fn test_self_txns_ttoz_withmemo() {
 
 #[test]
 fn test_self_txns_ttoz_nomemo() {
-    let mut rng = OsRng;
     let secp = Secp256k1::new();
 
     let (wallet, _txid1, block_hash) = get_test_wallet(0);
@@ -1078,11 +1076,13 @@ fn test_self_txns_ttoz_nomemo() {
 
     const TAMOUNT1: u64 = 50000;
 
-    let mut tx = FakeTransaction::new(&mut rng);
-    tx.add_t_output(&pk, TAMOUNT1);
-    let txid1 = tx.get_tx().txid();
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_output(&pk, TAMOUNT1);
 
-    wallet.scan_full_tx(&tx.get_tx(), 1, 0); 
+    let tx = ftx.get_tx();
+    let txid1 = tx.txid();
+
+    wallet.scan_full_tx(&tx, 1, 0); 
 
     {
         let txs = wallet.txs.read().unwrap();
@@ -1358,7 +1358,6 @@ fn test_z_spend_to_taddr() {
 
 #[test]
 fn test_transparent_only_send() {
-    let mut rng = OsRng;
     let secp = Secp256k1::new();
 
     const AMOUNT_Z: u64 = 90000;
@@ -1368,11 +1367,13 @@ fn test_transparent_only_send() {
     let pk = PublicKey::from_secret_key(&secp, &wallet.tkeys.read().unwrap()[0]);
     let taddr = wallet.address_from_sk(&wallet.tkeys.read().unwrap()[0]);
 
-    let mut tx = FakeTransaction::new(&mut rng);
-    tx.add_t_output(&pk, AMOUNT_T);
-    let txid_t = tx.get_tx().txid();
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_output(&pk, AMOUNT_T);
 
-    wallet.scan_full_tx(&tx.get_tx(), 1, 0);  // Pretend it is at height 1
+    let tx = ftx.get_tx();
+    let txid_t = tx.txid();
+
+    wallet.scan_full_tx(&tx, 1, 0);  // Pretend it is at height 1
 
     {
         let txs = wallet.txs.read().unwrap();
@@ -1427,7 +1428,6 @@ fn test_transparent_only_send() {
 
 #[test]
 fn test_t_spend_to_z() {
-    let mut rng = OsRng;
     let secp = Secp256k1::new();
 
     const AMOUNT_Z: u64 = 50000;
@@ -1437,11 +1437,13 @@ fn test_t_spend_to_z() {
     let pk = PublicKey::from_secret_key(&secp, &wallet.tkeys.read().unwrap()[0]);
     let taddr = wallet.address_from_sk(&wallet.tkeys.read().unwrap()[0]);
 
-    let mut tx = FakeTransaction::new(&mut rng);
-    tx.add_t_output(&pk, AMOUNT_T);
-    let txid_t = tx.get_tx().txid();
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_output(&pk, AMOUNT_T);
 
-    wallet.scan_full_tx(&tx.get_tx(), 1, 0);  // Pretend it is at height 1
+    let tx = ftx.get_tx();
+    let txid_t = tx.txid();
+
+    wallet.scan_full_tx(&tx, 1, 0);  // Pretend it is at height 1
 
     {
         let txs = wallet.txs.read().unwrap();
@@ -1636,7 +1638,6 @@ fn test_add_new_zt_hd_after_incoming() {
     // NOw, 5 new addresses should be created
     assert_eq!(wallet.zkeys.read().unwrap().len(), 6+5);     
 
-    let mut rng = OsRng;
     let secp = Secp256k1::new();
     // Send a fake transaction to the last taddr
     let pk = PublicKey::from_secret_key(&secp, &wallet.tkeys.read().unwrap().last().unwrap());
@@ -1645,9 +1646,11 @@ fn test_add_new_zt_hd_after_incoming() {
     assert_eq!(wallet.taddresses.read().unwrap().len(), 1); 
 
     // Send a Tx to the last address
-    let mut tx = FakeTransaction::new(&mut rng);
-    tx.add_t_output(&pk, AMOUNT1);
-    wallet.scan_full_tx(&tx.get_tx(), 3, 0);  
+    let mut ftx = FakeTransaction::new();
+    ftx.add_t_output(&pk, AMOUNT1);
+
+    let tx = ftx.get_tx();
+    wallet.scan_full_tx(&tx, 3, 0);  
 
     // Now, 5 new addresses should be created. 
     assert_eq!(wallet.taddresses.read().unwrap().len(), 1+5); 
@@ -2232,7 +2235,6 @@ fn test_t_z_derivation() {
         server: "0.0.0.0:0".parse().unwrap(),
         chain_name: "main".to_string(),
         sapling_activation_height: 0,
-        consensus_branch_id: "000000".to_string(),
         anchor_offset: 1,
         data_dir: None,
     };
@@ -2388,7 +2390,6 @@ fn test_import_birthday_adjust() {
         server: "0.0.0.0:0".parse().unwrap(),
         chain_name: "main".to_string(),
         sapling_activation_height: 5,
-        consensus_branch_id: "000000".to_string(),
         anchor_offset: 0,
         data_dir: None,
     };
