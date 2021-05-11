@@ -51,19 +51,6 @@ group = "0.8"
 
 
 [dependencies.zcash_client_backend]
-<<<<<<< HEAD
-git = "https://github.com/ZbayApp/librustzcash"
-rev = "9978187dca0e97da97894588fbbf774e130b2d78"
-
-[dependencies.zcash_primitives]
-git = "https://github.com/ZbayApp/librustzcash"
-rev = "9978187dca0e97da97894588fbbf774e130b2d78"
-features = ["transparent-inputs"]
-
-[dependencies.zcash_proofs]
-git = "https://github.com/ZbayApp/librustzcash"
-rev = "9978187dca0e97da97894588fbbf774e130b2d78"
-=======
 git = "https://github.com/adityapk00/librustzcash"
 rev = "28df48aecdaaea1a01ab7e526fb36ff5e6708851"
 #path = "../../librustzcash/zcash_client_backend"
@@ -78,7 +65,6 @@ features = ["transparent-inputs"]
 git = "https://github.com/adityapk00/librustzcash"
 rev = "28df48aecdaaea1a01ab7e526fb36ff5e6708851"
 #path = "../../librustzcash/zcash_proofs"
->>>>>>> upstream/master
 features = ["multicore"]
 
 [build-dependencies]
