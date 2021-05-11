@@ -9,6 +9,7 @@ embed_params = []
 
 [dependencies]
 base58 = "0.1.0"
+base64 = "0.12.3"
 log = "0.4"
 log4rs = "0.8.3"
 dirs = "2.0.2"
@@ -30,6 +31,7 @@ libflate = "0.1"
 subtle = "2"
 threadpool = "1.8.0"
 num_cpus = "1.12.0"
+rayon = "1.5"
 
 tonic = { version = "0.2.1", features = ["tls", "tls-roots"] }
 bytes = "0.4"
@@ -40,14 +42,16 @@ tokio-rustls = { version = "0.13.0" }
 webpki = "0.21.0"
 webpki-roots = "0.18.0"
 
-bellman = { version = "0.8", default-features = false, features = ["groth16"] }
+bellman = { version = "0.8.1", default-features = false, features = ["groth16"] }
 pairing = "0.18.0"
 ff = "0.8"
 jubjub = "0.5.1"
 bls12_381 = "0.3.1"
 group = "0.8"
 
+
 [dependencies.zcash_client_backend]
+<<<<<<< HEAD
 git = "https://github.com/ZbayApp/librustzcash"
 rev = "9978187dca0e97da97894588fbbf774e130b2d78"
 
@@ -59,6 +63,22 @@ features = ["transparent-inputs"]
 [dependencies.zcash_proofs]
 git = "https://github.com/ZbayApp/librustzcash"
 rev = "9978187dca0e97da97894588fbbf774e130b2d78"
+=======
+git = "https://github.com/adityapk00/librustzcash"
+rev = "28df48aecdaaea1a01ab7e526fb36ff5e6708851"
+#path = "../../librustzcash/zcash_client_backend"
+
+[dependencies.zcash_primitives]
+git = "https://github.com/adityapk00/librustzcash"
+rev = "28df48aecdaaea1a01ab7e526fb36ff5e6708851"
+#path = "../../librustzcash/zcash_primitives"
+features = ["transparent-inputs"]
+
+[dependencies.zcash_proofs]
+git = "https://github.com/adityapk00/librustzcash"
+rev = "28df48aecdaaea1a01ab7e526fb36ff5e6708851"
+#path = "../../librustzcash/zcash_proofs"
+>>>>>>> upstream/master
 features = ["multicore"]
 
 [build-dependencies]

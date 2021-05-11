@@ -1,67 +1,73 @@
-use std::time::{SystemTime, Duration};
-use std::io::{self, Read, Write};
 use std::cmp;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
-use std::io::{Error, ErrorKind};
 use std::convert::TryFrom;
+use std::io::{self, Read, Write};
+use std::io::{Error, ErrorKind};
+use std::sync::{Arc, RwLock};
+use std::time::{SystemTime};
 
+use std::sync::mpsc::channel;
 use threadpool::ThreadPool;
-use zcash_proofs::prover::LocalTxProver;
-use std::sync::mpsc::{channel};
 
-use rand::{Rng, rngs::OsRng};
+use log::{error, info, warn};
+use rand::{rngs::OsRng, Rng};
 use subtle::{ConditionallySelectable, ConstantTimeEq, CtOption};
-use log::{info, warn, error};
 
-use protobuf::parse_from_bytes;
-
-use libflate::gzip::{Decoder};
+use bip39::{Language, Mnemonic};
+use libflate::gzip::Decoder;
 use secp256k1::SecretKey;
-use bip39::{Mnemonic, Language};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use sodiumoxide::crypto::secretbox;
 
 use zcash_client_backend::{
-    encoding::{encode_payment_address, encode_extended_spending_key, encode_extended_full_viewing_key, decode_extended_spending_key, decode_extended_full_viewing_key},
+    encoding::{
+        decode_extended_full_viewing_key, decode_extended_spending_key,
+        encode_extended_full_viewing_key, encode_extended_spending_key, encode_payment_address,
+    },
     proto::compact_formats::{CompactBlock, CompactOutput},
-    wallet::{WalletShieldedOutput, WalletShieldedSpend}
+    wallet::{WalletShieldedOutput, WalletShieldedSpend},
 };
 
 use zcash_primitives::{
     block::BlockHash,
-    serialize::{Vector},
-    consensus::{MAIN_NETWORK, BranchId, BlockHeight},
-    transaction::{
-        builder::{Builder},
-        components::{Amount, OutPoint, TxOut}, components::amount::DEFAULT_FEE,
-        TxId, Transaction, 
-    },
-    sapling::Node,
-    merkle_tree::{CommitmentTree, IncrementalWitness},
+    consensus::{BlockHeight, BranchId, MAIN_NETWORK},
     legacy::{Script, TransparentAddress},
-    note_encryption::{Memo, try_sapling_note_decryption, try_sapling_output_recovery, try_sapling_compact_note_decryption},
-    zip32::{ExtendedFullViewingKey, ExtendedSpendingKey, ChildIndex},
-    primitives::{PaymentAddress},
+    merkle_tree::{CommitmentTree, IncrementalWitness},
+    note_encryption::{
+        try_sapling_compact_note_decryption, try_sapling_note_decryption,
+        try_sapling_output_recovery, Memo,
+    },
+    primitives::PaymentAddress,
+    prover::TxProver,
+    sapling::Node,
+    serialize::Vector,
+    transaction::{
+        builder::Builder,
+        components::{Amount, OutPoint, TxOut},
+        Transaction, TxId,
+    },
+    zip32::{ChildIndex, ExtendedFullViewingKey, ExtendedSpendingKey},
 };
 
-use crate::lightclient::{LightClientConfig};
-
+use crate::lightclient::LightClientConfig;
+mod address;
 mod data;
 mod extended_key;
-mod utils;
-mod address;
+pub(crate) mod message;
+pub mod utils;
 mod walletzkey;
 
-use data::{BlockData, WalletTx, Utxo, SaplingNoteData, SpendableNote, OutgoingTxMetadata};
-use extended_key::{KeyIndex, ExtendedPrivKey};
+pub mod fee;
+
+use data::{BlockData, OutgoingTxMetadata, SaplingNoteData, SpendableNote, Utxo, WalletTx};
+use extended_key::{ExtendedPrivKey, KeyIndex};
 use walletzkey::{WalletZKey, WalletZKeyType};
 
 pub const MAX_REORG: usize = 100;
-pub const GAP_RULE_UNUSED_ADDRESSES: usize = if cfg!(any(target_os="ios", target_os="android")) { 1 } else { 5 };
+pub const GAP_RULE_UNUSED_ADDRESSES: usize = if cfg!(any(target_os="ios", target_os="android")) { 0 } else { 5 };
 
 fn now() -> f64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as f64
@@ -75,6 +81,8 @@ pub fn double_sha256(payload: &[u8]) -> Vec<u8> {
 }
 
 use base58::{ToBase58};
+
+use self::message::Message;
 
 /// A trait for converting a [u8] to base58 encoded string.
 pub trait ToBase58Check {
@@ -96,6 +104,36 @@ impl ToBase58Check for [u8] {
         payload.append(&mut checksum[..4].to_vec());
         payload.to_base58()
     }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct SendProgress {
+    pub id: u32,
+    pub is_send_in_progress: bool,
+    pub progress: u32,
+    pub total: u32,
+    pub last_error: Option<String>,
+    pub last_txid: Option<String>,
+}
+
+impl SendProgress {
+    fn new(id: u32) -> Self {
+        SendProgress {            
+            id,
+            is_send_in_progress: false,
+            progress: 0,
+            total: 0,
+            last_error: None,
+            last_txid: None,
+        }
+    }
+}
+
+// Enum to refer to the first or last position of the Node
+pub enum NodePosition {
+    First,
+    Last
 }
 
 pub struct LightWallet {
@@ -132,16 +170,23 @@ pub struct LightWallet {
     // will start from here.
     birthday: u64,
 
+    // If this wallet's initial block was verified
+    sapling_tree_verified: bool,
+
     // Non-serialized fields
     config: LightClientConfig,
 
-    pub total_scan_duration: Arc<RwLock<Vec<Duration>>>,
+    send_progress: Arc<RwLock<SendProgress>>,
 }
 
 impl LightWallet {
     pub fn serialized_version() -> u64 {
-        return 10;
+        return 13;
     }
+
+    pub fn is_sapling_tree_verified(&self) -> bool { self.sapling_tree_verified }
+
+    pub fn set_sapling_tree_verified(&mut self) { self.sapling_tree_verified = true; }
 
     fn get_taddr_from_bip39seed(config: &LightClientConfig, bip39_seed: &[u8], pos: u32) -> SecretKey {
         assert_eq!(bip39_seed.len(), 64);
@@ -234,7 +279,8 @@ impl LightWallet {
             mempool_txs: Arc::new(RwLock::new(HashMap::new())),
             config:      config.clone(),
             birthday:    latest_block,
-            total_scan_duration: Arc::new(RwLock::new(vec![Duration::new(0, 0)]))
+            sapling_tree_verified: false,
+            send_progress: Arc::new(RwLock::new(SendProgress::new(0))),
         };
 
         // If restoring from seed, make sure we are creating 5 addresses for users
@@ -256,7 +302,6 @@ impl LightWallet {
             return Err(io::Error::new(ErrorKind::InvalidData, e));
         }
 
-        println!("Reading wallet version {}", version);
         info!("Reading wallet version {}", version);
         
         // At version 5, we're writing the rest of the file as a compressed stream (gzip)
@@ -376,6 +421,10 @@ impl LightWallet {
 
         let birthday = reader.read_u64::<LittleEndian>()?;
 
+        let sapling_tree_verified = if version <= 12 { true } else {
+            reader.read_u8()? == 1
+        };
+
         // If version <= 8, adjust the "is_spendable" status of each note data
         if version <= 8 {
             // Collect all spendable keys
@@ -384,8 +433,8 @@ impl LightWallet {
                 .collect();
             txs.values_mut().for_each(|tx| {
                 tx.notes.iter_mut().for_each(|nd| {
-                    nd.is_spendable = spendable_keys.contains(&nd.extfvk);
-                    if !nd.is_spendable {
+                    nd.have_spending_key = spendable_keys.contains(&nd.extfvk);
+                    if !nd.have_spending_key {
                         nd.witnesses.clear();
                     }
                 })
@@ -406,12 +455,24 @@ impl LightWallet {
             mempool_txs: Arc::new(RwLock::new(HashMap::new())),
             config:      config.clone(),
             birthday,
-            total_scan_duration: Arc::new(RwLock::new(vec![Duration::new(0, 0)])),
+            sapling_tree_verified,
+            send_progress: Arc::new(RwLock::new(SendProgress::new(0))),  // This is not persisted
         };
 
         // Do a one-time fix of the spent_at_height for older wallets
-        if version <= 7 {
+        if version <= 10 {
             lw.fix_spent_at_height();
+        }
+
+        // On mobile, clear out any unused addresses
+        if cfg!(any(target_os="ios", target_os="android")) { 
+            // Before version 11, where we had extra z and t addrs for mobile.
+            if version <= 11 {
+                // Remove extra addresses. Note that this will only remove the extra addresses if the user has used only 1
+                // z address and only 1 t address, which should be the case on mobile (unless the user is reusing the desktop seed)
+                lw.remove_unused_zaddrs();
+                lw.remove_unused_taddrs();
+            }
         }
 
         Ok(lw)
@@ -475,7 +536,10 @@ impl LightWallet {
 
         // While writing the birthday, get it from the fn so we recalculate it properly
         // in case of rescans etc...
-        writer.write_u64::<LittleEndian>(self.get_birthday())
+        writer.write_u64::<LittleEndian>(self.get_birthday())?;
+
+        // If the sapling tree was verified
+        writer.write_u8( if self.sapling_tree_verified { 1 } else { 0 })
     }
 
     pub fn note_address(hrp: &str, note: &SaplingNoteData) -> Option<String> {
@@ -662,7 +726,7 @@ impl LightWallet {
         self.mempool_txs.write().unwrap().clear();
     }
 
-    pub fn set_initial_block(&self, height: i32, hash: &str, sapling_tree: &str) -> bool {
+    pub fn set_initial_block(&mut self, height: i32, hash: &str, sapling_tree: &str) -> bool {
         let mut blocks = self.blocks.write().unwrap();
         if !blocks.is_empty() {
             return false;
@@ -688,6 +752,10 @@ impl LightWallet {
             }
         };
 
+        // Reset the verification status
+        info!("Reset the sapling tree verified to false");
+        self.sapling_tree_verified = false;
+        
         if let Ok(tree) = CommitmentTree::read(&sapling_tree[..]) {
             blocks.push(BlockData { height, hash, tree });
             true
@@ -696,15 +764,50 @@ impl LightWallet {
         }
     }
 
+    // Get the current sending status.
+    pub fn get_send_progress(&self) -> SendProgress {
+        self.send_progress.read().unwrap().clone()
+    }
+
+    // Set the previous send's status as an error
+    fn set_send_error(&self, e: String) {
+        let mut p = self.send_progress.write().unwrap();
+
+        p.is_send_in_progress = false;
+        p.last_error = Some(e);
+    }
+
+    // Set the previous send's status as success
+    fn set_send_success(&self, txid: String) {
+        let mut p = self.send_progress.write().unwrap();
+
+        p.is_send_in_progress = false;
+        p.last_txid = Some(txid);
+    }
+
+    // Reset the send progress status to blank
+    fn reset_send_progress(&self) {
+        let mut g = self.send_progress.write().unwrap();
+        let next_id = g.id + 1;
+        
+        // Discard the old value, since we are replacing it
+        let _ = std::mem::replace(&mut *g, SendProgress::new(next_id));
+    }
+
     // Get the latest sapling commitment tree. It will return the height and the hex-encoded sapling commitment tree at that height
-    pub fn get_sapling_tree(&self) -> Result<(i32, String, String), String> {
+    pub fn get_wallet_sapling_tree(&self, block_pos: NodePosition) -> Result<(i32, String, String), String> {
         let blocks = self.blocks.read().unwrap();
 
-        let block = match blocks.last() {
-            Some(block) => block,
-            None => return Err("Couldn't get a block height!".to_string())
+        let block = match block_pos {
+            NodePosition::First => blocks.first(),
+            NodePosition::Last => blocks.last()
         };
 
+        if block.is_none() {
+            return Err("Couldn't get a block height!".to_string());
+        }
+
+        let block = block.unwrap();
         let mut write_buf = vec![];
         block.tree.write(&mut write_buf).map_err(|e| format!("Error writing commitment tree {}", e))?;
 
@@ -754,7 +857,7 @@ impl LightWallet {
         }
     }
 
-    pub fn memo_str(memo: &Option<Memo>) -> Option<String> {
+    pub fn memo_str(memo: Option<Memo>) -> Option<String> {
         match memo {
             Some(memo) => {
                 match memo.to_utf8() {
@@ -1147,6 +1250,7 @@ impl LightWallet {
                         script: vout.script_pubkey.0.clone(),
                         value: vout.value.into(),
                         height,
+                        spent_at_height: None,
                         spent: None,
                         unconfirmed_spent: None,
                     });
@@ -1157,6 +1261,10 @@ impl LightWallet {
 
     // If one of the last 'n' taddress was used, ensure we add the next HD taddress to the wallet. 
     pub fn ensure_hd_taddresses(&self, address: &String) {        
+        if GAP_RULE_UNUSED_ADDRESSES == 0 {
+            return;
+        }
+
         let last_addresses = {
             self.taddresses.read().unwrap().iter().rev().take(GAP_RULE_UNUSED_ADDRESSES).map(|s| s.clone()).collect::<Vec<String>>()
         };
@@ -1180,6 +1288,10 @@ impl LightWallet {
 
     // If one of the last 'n' zaddress was used, ensure we add the next HD zaddress to the wallet
     pub fn ensure_hd_zaddresses(&self, address: &String) {
+        if GAP_RULE_UNUSED_ADDRESSES == 0 {
+            return;
+        }
+
         let last_addresses = {
             self.zkeys.read().unwrap().iter()
                 .filter(|zk| zk.keytype == WalletZKeyType::HdKey)
@@ -1206,6 +1318,64 @@ impl LightWallet {
         }
     }
 
+    pub fn remove_unused_taddrs(&self) {
+        if self.tkeys.read().unwrap().len() <= 1 {
+            return;
+        }
+
+        let txns = self.txs.write().unwrap();
+        let taddrs = self.taddresses.read().unwrap().iter().map(|a| a.clone()).collect::<Vec<_>>();
+
+        let highest_account = txns.values()
+            .flat_map(|wtx| 
+                wtx.utxos.iter().map(|u| taddrs.iter().position(|taddr| *taddr == u.address).unwrap_or(taddrs.len()))
+            )
+            .max();
+
+        if highest_account.is_none() {
+            return;
+        }
+
+        if highest_account.unwrap() == 0 {
+            // Remove unused addresses
+            self.tkeys.write().unwrap().truncate(1);
+            self.taddresses.write().unwrap().truncate(1);
+        }
+    }
+
+    pub fn remove_unused_zaddrs(&self) {
+        if self.zkeys.read().unwrap().len() <=1 {
+            return;
+        }
+
+        let txns = self.txs.write().unwrap();
+        let highest_account = txns.values().flat_map(|wtx| wtx.notes.iter().map(|n| n.account)).max();
+        if highest_account.is_none() {
+            return;
+        }
+
+        if highest_account.unwrap() == 0 {
+            // Remove unused addresses
+            self.zkeys.write().unwrap().truncate(1);
+        }
+    }
+    
+    pub fn decrypt_message(&self, enc: Vec<u8>) -> Option<Message> {
+        // Collect all the ivks in the wallet
+        let ivks: Vec<_> = self.zkeys.read().unwrap().iter().map(|zk| zk.extfvk.fvk.vk.ivk()).collect();
+
+        // Attempt decryption with all available ivks, one at a time. This is pretty fast, so need need for fancy multithreading
+        for ivk in ivks {
+            if let Ok(msg) = Message::decrypt(&enc, ivk) {
+                // If decryption succeeded for this IVK, return the decrypted memo and the matched address
+                return Some(msg)
+            }
+        }
+
+        // If nothing matched
+        None
+    }
+
     // Scan the full Tx and update memos for incoming shielded transactions.
     pub fn scan_full_tx(&self, tx: &Transaction, height: i32, datetime: u64) {
         let mut total_transparent_spend: u64 = 0;
@@ -1225,6 +1395,7 @@ impl LightWallet {
                     match spent_utxo {
                         Some(su) => {
                             info!("Spent utxo from {} was spent in {}", txid, tx.txid());
+                            su.spent_at_height = Some(height);
                             su.spent = Some(tx.txid().clone());
                             su.unconfirmed_spent = None;
 
@@ -1330,7 +1501,7 @@ impl LightWallet {
                     None => continue,
                 };
    
-                info!("A sapling note was sent to wallet in {}", tx.txid());
+                info!("A sapling note was received into the wallet in {}", tx.txid());
                 
                 // Do it in a short scope because of the write lock.   
                 let mut txs = self.txs.write().unwrap();
@@ -1455,14 +1626,29 @@ impl LightWallet {
             // were spent in any of the txids that were removed
             txs.values_mut()
                 .for_each(|wtx| {
+                    // Update notes to rollback any spent notes
                     wtx.notes.iter_mut()
                         .for_each(|nd| {
                             if nd.spent.is_some() && txids_to_remove.contains(&nd.spent.unwrap()) {
                                 nd.spent = None;
+                                nd.spent_at_height = None;
                             }
 
                             if nd.unconfirmed_spent.is_some() && txids_to_remove.contains(&nd.spent.unwrap()) {
                                 nd.unconfirmed_spent = None;
+                            }
+                        });
+                    
+                    // Update UTXOs to rollback any spent utxos
+                    wtx.utxos.iter_mut()
+                        .for_each(|utxo| {
+                            if utxo.spent.is_some() && txids_to_remove.contains(&utxo.spent.unwrap()) {
+                                utxo.spent = None;
+                                utxo.spent_at_height = None;
+                            }
+
+                            if utxo.unconfirmed_spent.is_some() && txids_to_remove.contains(&utxo.unconfirmed_spent.unwrap().0) {
+                                utxo.unconfirmed_spent = None;
                             }
                         })
                 })
@@ -1535,15 +1721,25 @@ impl LightWallet {
 
         // Increment tree and witnesses
         let node = Node::new(cmu.into());
-        for witness in existing_witnesses {
-            witness.append(node).unwrap();
+
+        // For existing witnesses, do the insertion parallely, so that we can speed it up, since there
+        // are likely to be many existing witnesses
+        {
+            use rayon::prelude::*;
+
+            existing_witnesses.par_iter_mut().for_each(|witness| {
+                witness.append(node).unwrap();
+            });
         }
+
+        // These are likely empty or len() == 1, so no point doing it parallely. 
         for witness in block_witnesses {
             witness.append(node).unwrap();
         }
         for witness in new_witnesses {
             witness.append(node).unwrap();
         }
+        
         tree.append(node).unwrap();
 
         // Collect all the RXs and fine if there was a valid result somewhere
@@ -1716,7 +1912,7 @@ impl LightWallet {
 
     // Scan a block. Will return an error with the block height that failed to scan
     pub fn scan_block_with_pool(&self, block_bytes: &[u8], pool: &ThreadPool) -> Result<Vec<TxId>, i32> {
-        let block: CompactBlock = match parse_from_bytes(block_bytes) {
+        let block: CompactBlock = match protobuf::Message::parse_from_bytes(block_bytes) {
             Ok(block) => block,
             Err(e) => {
                 error!("Could not parse CompactBlock from bytes: {}", e);
@@ -1772,12 +1968,24 @@ impl LightWallet {
             // Create a write lock 
             let mut txs = self.txs.write().unwrap();
 
-            // Remove the older witnesses from the SaplingNoteData, so that we don't save them 
+            // Remove witnesses from the SaplingNoteData, so that we don't save them 
             // in the wallet, taking up unnecessary space
+            // Witnesses are removed if:
+            // 1. They are old (i.e. spent over a 100 blocks ago), so no risk of the tx getting reorged
+            // 2. If they are 0-value, so they will never be spent
+            // 3. Are not spendable - i.e., don't have a spending key, so no point keeping them updated
             txs.values_mut().for_each(|wtx| {
                 wtx.notes
                     .iter_mut()
-                    .filter(|nd| nd.spent.is_some() && nd.spent_at_height.is_some() && nd.spent_at_height.unwrap() < height - (MAX_REORG as i32) - 1)
+                    .filter(|nd| {
+                        // Was this a spent note that was spent over a 100 blocks ago?
+                        let is_note_old = nd.spent.is_some() && nd.spent_at_height.is_some() && nd.spent_at_height.unwrap() < height - (MAX_REORG as i32) - 1;
+                        
+                        // Is this a zero-value note?
+                        let is_zero_note = nd.note.value == 0;
+                        
+                        return is_note_old || is_zero_note || !nd.have_spending_key;
+                    })
                     .for_each(|nd| {
                         nd.witnesses.clear()
                     })
@@ -1805,16 +2013,15 @@ impl LightWallet {
             for tx in txs.values_mut() {
                 for nd in tx.notes.iter_mut() {
                     // Duplicate the most recent witness
-                    if nd.is_spendable {
-                        if let Some(witness) = nd.witnesses.last() {
-                            let clone = witness.clone();
-                            nd.witnesses.push(clone);
-                        }
-                        // Trim the oldest witnesses
-                        nd.witnesses = nd
-                            .witnesses
-                            .split_off(nd.witnesses.len().saturating_sub(100));
+                    if let Some(witness) = nd.witnesses.last() {
+                        let clone = witness.clone();
+                        nd.witnesses.push(clone);
                     }
+
+                    // Trim the oldest witnesses, keeping around only MAX_REORG witnesses
+                    nd.witnesses = nd
+                        .witnesses
+                        .split_off(nd.witnesses.len().saturating_sub(MAX_REORG));
                 }
             }
 
@@ -1825,23 +2032,7 @@ impl LightWallet {
                 // Create a single mutable slice of all the wallet's note's witnesses.
                 let mut witness_refs: Vec<_> = txs
                     .values_mut()
-                    .map(|tx| 
-                        tx.notes.iter_mut()
-                            .filter_map(|nd| 
-                                if !nd.is_spendable { 
-                                    // If the note is not spendable, then no point updating it
-                                    None
-                                } else if nd.spent.is_none() && nd.unconfirmed_spent.is_none() {
-                                    // Note was not spent 
-                                    nd.witnesses.last_mut() 
-                                } else if nd.spent.is_some() && nd.spent_at_height.is_some() && nd.spent_at_height.unwrap() < height - (MAX_REORG as i32) - 1 {
-                                   // Note was spent in the last 100 blocks
-                                    nd.witnesses.last_mut() 
-                                } else {
-                                    // If note was old (spent NOT in the last 100 blocks)
-                                    None 
-                                }))
-                    .flatten()
+                    .flat_map(|tx| tx.notes.iter_mut().filter_map(|nd| nd.witnesses.last_mut()))
                     .collect();
 
                 self.scan_block_internal(
@@ -1894,7 +2085,7 @@ impl LightWallet {
                 info!("Marked a note as spent");
                 spent_note.spent = Some(tx.txid);
                 spent_note.spent_at_height = Some(height);
-                spent_note.unconfirmed_spent = None::<TxId>;
+                spent_note.unconfirmed_spent = None;
 
                 total_shielded_value_spent += spent_note.note.value;
             }
@@ -1942,12 +2133,12 @@ impl LightWallet {
         
         {
             // Cleanup mempool tx after adding a block, to remove all txns that got mined
-            self.cleanup_mempool();
+            self.cleanup_mempool_unconfirmedtx();
         }
 
         // Print info about the block every 10,000 blocks
         if height % 10_000 == 0 {
-            match self.get_sapling_tree() {
+            match self.get_wallet_sapling_tree(NodePosition::Last) {
                 Ok((h, hash, stree)) => info!("Sapling tree at height\n({}, \"{}\",\"{}\"),", h, hash, stree),
                 Err(e) => error!("Couldn't determine sapling tree: {}", e)
             }
@@ -1970,13 +2161,47 @@ impl LightWallet {
                     nd.spent_at_height = spent_txid_map.get(&nd.spent.unwrap()).map(|b| *b);
                 })
         });
+
+        // Go over all the Utxos that might need updating
+        self.txs.write().unwrap().values_mut().for_each(|wtx| {
+            wtx.utxos.iter_mut()
+                .filter(|utxo| utxo.spent.is_some() && utxo.spent_at_height.is_none())
+                .for_each(|utxo| {
+                    utxo.spent_at_height = spent_txid_map.get(&utxo.spent.unwrap()).map(|b| *b);
+                })
+        });
     }
 
-    pub fn send_to_address<F> (
+    pub fn send_to_address<F, P: TxProver> (
         &self,
         consensus_branch_id: u32,
-        spend_params: &[u8],
-        output_params: &[u8],
+        prover: P,
+        transparent_only: bool,
+        tos: Vec<(&str, u64, Option<String>)>,
+        broadcast_fn: F
+    ) -> Result<(String, Vec<u8>), String> 
+        where F: Fn(Box<[u8]>) -> Result<String, String>
+    {
+        // Reset the progress to start. Any errors will get recorded here
+        self.reset_send_progress();
+
+        // Call the internal function
+        match self.send_to_address_internal(consensus_branch_id, prover, transparent_only, tos, broadcast_fn) {
+            Ok((txid, rawtx)) => {
+                self.set_send_success(txid.clone());
+                Ok((txid, rawtx))
+            },
+            Err(e) => {
+                self.set_send_error(format!("{}", e));
+                Err(e)
+            }
+        }
+    }
+
+    fn send_to_address_internal<F, P: TxProver> (
+        &self,
+        consensus_branch_id: u32,
+        prover: P,
         transparent_only: bool,
         tos: Vec<(&str, u64, Option<String>)>,
         broadcast_fn: F
@@ -2029,15 +2254,17 @@ impl LightWallet {
 
         // Select notes to cover the target value
         println!("{}: Selecting notes", now() - start_time);
-        let target_value = Amount::from_u64(total_value).unwrap() + DEFAULT_FEE ;
+        
+        let fee = fee::get_default_fee(height as i32);
+        let target_value = Amount::from_u64(total_value).unwrap() + Amount::from_u64(fee).unwrap();
 
         // Select the candidate notes that are eligible to be spent
         let mut candidate_notes: Vec<_> = if transparent_only {
             vec![]
         } else {
             self.txs.read().unwrap().iter()
-                .map(|(txid, tx)| tx.notes.iter().map(move |note| (*txid, note)))
-                .flatten()
+                .flat_map(|(txid, tx)| tx.notes.iter().map(move |note| (*txid, note)))
+                .filter(|(_, note)| note.note.value > 0)
                 .filter_map(|(txid, note)| {
                     // Filter out notes that are already spent
                     if note.spent.is_some() || note.unconfirmed_spent.is_some() {
@@ -2154,7 +2381,7 @@ impl LightWallet {
 
         // TODO: We're using the first ovk to encrypt outgoing Txns. Is that Ok?
         let ovk = self.zkeys.read().unwrap()[0].extfvk.fvk.ovk;
-
+        let mut total_z_recepients = 0u32;
         for (to, value, memo) in recepients {
             // Compute memo if it exists
             let encoded_memo = match memo {
@@ -2162,7 +2389,7 @@ impl LightWallet {
                 Some(s) => {
                     // If the string starts with an "0x", and contains only hex chars ([a-f0-9]+) then
                     // interpret it as a hex
-                    match utils::interpret_memo_string(&s) {
+                    match utils::interpret_memo_string(s) {
                         Ok(m) => Some(m),
                         Err(e) => {
                             error!("{}", e);
@@ -2176,6 +2403,7 @@ impl LightWallet {
 
             if let Err(e) = match to {
                 address::RecipientAddress::Shielded(to) => {
+                    total_z_recepients += 1;
                     builder.add_sapling_output(Some(ovk), to.clone(), value, encoded_memo)
                 }
                 address::RecipientAddress::Transparent(to) => {
@@ -2188,21 +2416,47 @@ impl LightWallet {
             }
         }
         
+        // Set up a channel to recieve updates on the progress of building the transaction.
+        let (tx, rx) = channel::<u32>();
+        let progress = self.send_progress.clone();
+        std::thread::spawn(move || {
+            while let Ok(r) = rx.recv() {
+                println!("Progress: {}", r);
+                progress.write().unwrap().progress = r;
+            }
+
+            println!("Progress finished");
+            progress.write().unwrap().is_send_in_progress = false;
+        });
+
+        {
+            let mut p = self.send_progress.write().unwrap();
+            p.is_send_in_progress = true;
+            p.progress = 0;
+            p.total = notes.len() as u32 + total_z_recepients;
+        }
+        
 
         println!("{}: Building transaction", now() - start_time);
-        let (tx, _) = match builder.build(
+        let (tx, _) = match builder.build_with_progress_notifier(
             BranchId::try_from(consensus_branch_id).unwrap(),
-            &LocalTxProver::from_bytes(spend_params, output_params),
+            &prover,
+            Some(tx)
         ) {
             Ok(res) => res,
             Err(e) => {
                 let e = format!("Error creating transaction: {:?}", e);
                 error!("{}", e);
+                self.send_progress.write().unwrap().is_send_in_progress = false;
                 return Err(e);
             }
         };
         println!("{}: Transaction created", now() - start_time);
         println!("Transaction ID: {}", tx.txid());
+
+        {
+            self.send_progress.write().unwrap().is_send_in_progress = false;
+        }
 
         // Create the TX bytes
         let mut raw_tx = vec![];
@@ -2219,7 +2473,7 @@ impl LightWallet {
                                         .notes.iter_mut()
                                         .find(|nd| &nd.nullifier[..] == &selected.nullifier[..])
                                         .unwrap();
-                spent_note.unconfirmed_spent = Some(tx.txid());
+                spent_note.unconfirmed_spent = Some((tx.txid(), height));
             }
 
             // Mark this utxo as unconfirmed spent
@@ -2227,7 +2481,7 @@ impl LightWallet {
                 let mut spent_utxo = txs.get_mut(&utxo.txid).unwrap().utxos.iter_mut()
                                         .find(|u| utxo.txid == u.txid && utxo.output_index == u.output_index)
                                         .unwrap();
-                spent_utxo.unconfirmed_spent = Some(tx.txid());
+                spent_utxo.unconfirmed_spent = Some((tx.txid(), height));
             }
         }
 
@@ -2249,7 +2503,7 @@ impl LightWallet {
                                     if !LightWallet::is_shielded_address(&addr.to_string(), &self.config) {
                                         Memo::default()
                                     } else {
-                                        match utils::interpret_memo_string(s) {
+                                        match utils::interpret_memo_string(s.clone()) {
                                             Ok(m) => m,
                                             Err(e) => {
                                                 error!("{}", e);
@@ -2282,7 +2536,8 @@ impl LightWallet {
     // if they :
     // 1. Have expired
     // 2. The Tx has been added to the wallet via a mined block
-    pub fn cleanup_mempool(&self) {
+    // We also clean up any expired unconfirmed transactions
+    pub fn cleanup_mempool_unconfirmedtx(&self) {
         const DEFAULT_TX_EXPIRY_DELTA: i32 = 20;
 
         let current_height = self.blocks.read().unwrap().last().map(|b| b.height).unwrap_or(0);
@@ -2299,6 +2554,26 @@ impl LightWallet {
             self.mempool_txs.write().unwrap().retain ( |txid, _| {
                 self.txs.read().unwrap().get(txid).is_none()
             });
+        }
+
+        // Also remove any dangling unconfirmed_spent after the default expiry height
+        {
+            self.txs.write().unwrap().values_mut()
+                .for_each(|wtx| {
+                    wtx.notes.iter_mut().for_each(|note| {
+                        if note.unconfirmed_spent.is_some() &&
+                            note.unconfirmed_spent.unwrap().1 as i32 + DEFAULT_TX_EXPIRY_DELTA < current_height {
+                            note.unconfirmed_spent = None;
+                        }
+                    });
+
+                    wtx.utxos.iter_mut().for_each(|utxo| {
+                        if utxo.unconfirmed_spent.is_some() &&
+                            utxo.unconfirmed_spent.unwrap().1 as i32 + DEFAULT_TX_EXPIRY_DELTA < current_height {
+                            utxo.unconfirmed_spent = None;
+                        }
+                    });
+                });
         }
     }
 }
